@@ -1,0 +1,474 @@
+diff --git a/hw/arm/xilinx_zynq.c b/hw/arm/xilinx_zynq.c
+index 0372cd0ac4..eb878ee53f 100644
+--- a/hw/arm/xilinx_zynq.c
++++ b/hw/arm/xilinx_zynq.c
+@@ -38,10 +38,18 @@
+ #include "system/reset.h"
+ #include "qom/object.h"
+ #include "exec/tswap.h"
+ #include "target/arm/cpu-qom.h"
+ #include "qapi/visitor.h"
++#include "qemu/log.h"
++
++#include "hw/misc/mmio-stub.h"
++#include <libfdt.h>
++#include <libfdt_env.h>
++
++/* Prototype for load_device_tree */
++void *load_device_tree(const char *filename, int *sizep, void **dtb, Error **errp);
+ 
+ #define TYPE_ZYNQ_MACHINE MACHINE_TYPE_NAME("xilinx-zynq-a9")
+ OBJECT_DECLARE_SIMPLE_TYPE(ZynqMachineState, ZYNQ_MACHINE)
+ 
+ /* board base frequency: 33.333333 MHz */
+@@ -91,10 +99,11 @@ static const int dma_irqs[8] = {
+ struct ZynqMachineState {
+     MachineState parent;
+     Clock *ps_clk;
+     ARMCPU *cpu[ZYNQ_MAX_CPUS];
+     uint8_t boot_mode;
++    char *pl_dtb;
+ };
+ 
+ static void zynq_write_board_setup(ARMCPU *cpu,
+                                    const struct arm_boot_info *info)
+ {
+@@ -113,10 +122,110 @@ static void zynq_write_board_setup(ARMCPU *cpu,
+                        sizeof(board_setup_blob), BOARD_SETUP_ADDR);
+ }
+ 
+ static struct arm_boot_info zynq_binfo = {};
+ 
++static bool extract_reg_property(const void *fdt, int node, hwaddr *base, uint64_t *size)
++{
++    int len;
++    const fdt32_t *reg = fdt_getprop(fdt, node, "reg", &len);
++
++    if (!reg || len != 8)
++        return false;
++    
++    *base = fdt32_to_cpu(reg[0]);
++    *size = fdt32_to_cpu(reg[1]);
++    return true;
++}
++
++static bool extract_interrupt_property(const void *fdt, int node, int *irq)
++{
++    int len;
++    const fdt32_t *interrupts = fdt_getprop(fdt, node, "interrupts", &len);
++    
++    if (!interrupts || len != 12)
++        return false;
++    
++    uint32_t phandle = fdt32_to_cpu(interrupts[0]);
++    uint32_t spi = fdt32_to_cpu(interrupts[1]);
++    uint32_t type = fdt32_to_cpu(interrupts[2]);
++    
++    if (phandle != 0 || type != 4)
++        return false;
++    
++    *irq = 32 + spi;
++    return true;
++}
++
++static const char *extract_chardev_id(const void *fdt, int node)
++{
++    return fdt_getprop(fdt, node, "qemu-chardev-id", NULL);
++}
++
++static void parse_and_create_mmio_stubs(const void *fdt, qemu_irq *pic)
++{
++    int axi_bus_node = fdt_path_offset(fdt, "/axi_bus");
++    if (axi_bus_node < 0) {
++        qemu_log_mask(LOG_GUEST_ERROR, "mmio-stub: /axi_bus node not found in DTB\n");
++        return;
++    }
++    
++    int node;
++    fdt_for_each_subnode(node, fdt, axi_bus_node) {
++        const char *compatible = fdt_getprop(fdt, node, "compatible", NULL);
++        if (!compatible || strcmp(compatible, "custom,mmio-stub") != 0)
++            continue;
++        
++        hwaddr base;
++        uint64_t size;
++        int irq;
++        const char *chardev_id;
++        
++        if (!extract_reg_property(fdt, node, &base, &size)) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                         "mmio-stub: invalid or missing reg property for node %s\n",
++                         fdt_get_name(fdt, node, NULL));
++            continue;
++        }
++        
++        if (!extract_interrupt_property(fdt, node, &irq)) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                         "mmio-stub: invalid or missing interrupts property for node %s\n",
++                         fdt_get_name(fdt, node, NULL));
++            continue;
++        }
++        
++        chardev_id = extract_chardev_id(fdt, node);
++        if (!chardev_id) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                         "mmio-stub: missing qemu-chardev-id property for node %s\n",
++                         fdt_get_name(fdt, node, NULL));
++            continue;
++        }
++        
++        Chardev *chr = qemu_chr_find(chardev_id);
++        if (!chr) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                         "mmio-stub: chardev '%s' not found for node %s\n",
++                         chardev_id, fdt_get_name(fdt, node, NULL));
++            continue;
++        }
++        
++        DeviceState *dev = qdev_new(TYPE_MMIO_STUB);
++        qdev_prop_set_chr(dev, "chardev", chr);
++        qdev_prop_set_uint64(dev, "size", size);
++        
++        SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++        sysbus_realize(sbd, &error_fatal);
++        sysbus_mmio_map(sbd, 0, base);
++        sysbus_connect_irq(sbd, 0, pic[irq - GIC_INTERNAL]);
++        
++        printf("mmio-stub: Created device at 0x%"HWADDR_PRIx" size 0x%"PRIx64" irq %d chardev %s\n",
++               base, size, irq, chardev_id);
++    }
++}
++
+ static void gem_init(uint32_t base, qemu_irq irq)
+ {
+     DeviceState *dev;
+     SysBusDevice *s;
+ 
+@@ -198,27 +307,48 @@ static void zynq_set_boot_mode(Object *obj, const char *str,
+         return;
+     }
+     m->boot_mode = mode;
+ }
+ 
++static char *zynq_get_pl_dtb(Object *obj, Error **errp)
++{
++    ZynqMachineState *m = ZYNQ_MACHINE(obj);
++    return g_strdup(m->pl_dtb);
++}
++
++static void zynq_set_pl_dtb(Object *obj, const char *value, Error **errp)
++{
++    ZynqMachineState *m = ZYNQ_MACHINE(obj);
++    g_free(m->pl_dtb);
++    m->pl_dtb = g_strdup(value);
++}
++
+ static void zynq_init(MachineState *machine)
+ {
+     ZynqMachineState *zynq_machine = ZYNQ_MACHINE(machine);
+     MemoryRegion *address_space_mem = get_system_memory();
+     MemoryRegion *ocm_ram = g_new(MemoryRegion, 1);
+     DeviceState *dev, *slcr;
+     SysBusDevice *busdev;
+     qemu_irq pic[GIC_EXT_IRQS];
+     int n;
+     unsigned int smp_cpus = machine->smp.cpus;
++    void *fdt = NULL;
++    int fdt_size;
+ 
+     /* max 2GB ram */
+     if (machine->ram_size > 2 * GiB) {
+         error_report("RAM size more than 2 GiB is not supported");
+         exit(EXIT_FAILURE);
+     }
+ 
++    /* Mandatory pl-dtb property */
++    if (!zynq_machine->pl_dtb) {
++        error_report("pl-dtb property is mandatory for xilinx-zynq-a9 machine");
++        exit(EXIT_FAILURE);
++    }
++
+     for (n = 0; n < smp_cpus; n++) {
+         Object *cpuobj = object_new(machine->cpu_type);
+ 
+         object_property_set_int(cpuobj, "midr", ZYNQ_BOARD_MIDR,
+                                 &error_fatal);
+@@ -280,10 +410,20 @@ static void zynq_init(MachineState *machine)
+ 
+     for (n = 0; n < GIC_EXT_IRQS; n++) {
+         pic[n] = qdev_get_gpio_in(dev, n);
+     }
+ 
++    // Load and parse DTB for MMIO stubs
++    fdt = load_device_tree(zynq_machine->pl_dtb, &fdt_size, &fdt, NULL);
++    if (!fdt) {
++        error_report("Failed to load DTB file: %s", zynq_machine->pl_dtb);
++        exit(EXIT_FAILURE);
++    }
++
++    // Parse DTB and create MMIO stub devices
++    parse_and_create_mmio_stubs(fdt, pic);
++
+     n = zynq_init_spi_flashes(0xE0006000, pic[58 - GIC_INTERNAL], false, 0);
+     n = zynq_init_spi_flashes(0xE0007000, pic[81 - GIC_INTERNAL], false, n);
+     n = zynq_init_spi_flashes(0xE000D000, pic[51 - GIC_INTERNAL], true, n);
+ 
+     sysbus_create_simple(TYPE_CHIPIDEA, 0xE0002000, pic[53 - GIC_INTERNAL]);
+@@ -442,10 +582,13 @@ static void zynq_init(MachineState *machine)
+     /* AMBA Network Interconnect Advanced Quality of Service (QoS-301) */
+     create_unimplemented_device("zynq.qos301_cpu", 0xF8946000, 0x130);
+     create_unimplemented_device("zynq.qos301_dmac", 0xF8947000, 0x130);
+     create_unimplemented_device("zynq.qos301_iou", 0xF8948000, 0x130);
+ 
++    // Free the DTB
++    g_free(fdt);
++
+     zynq_binfo.ram_size = machine->ram_size;
+     zynq_binfo.board_id = 0xd32;
+     zynq_binfo.loader_start = 0;
+     zynq_binfo.board_setup_addr = BOARD_SETUP_ADDR;
+     zynq_binfo.write_board_setup = zynq_write_board_setup;
+@@ -471,10 +614,17 @@ static void zynq_machine_class_init(ObjectClass *oc, const void *data)
+                                          zynq_set_boot_mode);
+     object_class_property_set_description(oc, "boot-mode",
+                                           "Supported boot modes:"
+                                           " jtag qspi sd nor");
+     object_property_set_default_str(prop, "qspi");
++    
++    // Add property for PL DTB file
++    prop = object_class_property_add_str(oc, "pl-dtb", zynq_get_pl_dtb,
++                                         zynq_set_pl_dtb);
++    // Set default value for PL DTB
++    object_class_property_set_description(oc, "pl-dtb",
++                                          "Path to DTB file for PL devices");
+ }
+ 
+ static const TypeInfo zynq_machine_type = {
+     .name = TYPE_ZYNQ_MACHINE,
+     .parent = TYPE_MACHINE,
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+index 4e35657468..ca659bd316 100644
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -233,6 +233,12 @@ config IOSB
+     bool
+ 
+ config XLNX_VERSAL_TRNG
+     bool
+ 
++# Config for MMIO Stub
++config MMIO_STUB
++    bool
++    default y if XILINX_AXI
++    depends on ARM
++
+ source macio/Kconfig
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index b1d8d8e5d2..221205530b 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -15,10 +15,13 @@ system_ss.add(when: 'CONFIG_INTEGRATOR_DEBUG', if_true: files('arm_integrator_de
+ system_ss.add(when: 'CONFIG_A9SCU', if_true: files('a9scu.c'))
+ system_ss.add(when: 'CONFIG_ARM11SCU', if_true: files('arm11scu.c'))
+ 
+ system_ss.add(when: 'CONFIG_ARM_V7M', if_true: files('armv7m_ras.c'))
+ 
++# MMIO Stub
++system_ss.add(when: 'CONFIG_MMIO_STUB', if_true: files('mmio-stub.c'))
++
+ # Mac devices
+ system_ss.add(when: 'CONFIG_MOS6522', if_true: files('mos6522.c'))
+ system_ss.add(when: 'CONFIG_DJMEMC', if_true: files('djmemc.c'))
+ system_ss.add(when: 'CONFIG_IOSB', if_true: files('iosb.c'))
+ 
+diff --git a/hw/misc/mmio-stub.c b/hw/misc/mmio-stub.c
+new file mode 100644
+index 0000000000..c291e13d57
+--- /dev/null
++++ b/hw/misc/mmio-stub.c
+@@ -0,0 +1,145 @@
++#include "qemu/osdep.h"
++#include "hw/misc/mmio-stub.h"
++#include "hw/qdev-properties.h"
++#include "hw/qdev-properties-system.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "chardev/char-fe.h"
++#include "qapi/error.h"
++
++static uint64_t mmio_stub_read(void *opaque, hwaddr addr, unsigned len)
++{
++    MMIOStub *dev = MMIO_STUB(opaque);
++    struct mmio_stub_msg_hdr hdr = {
++        .op = MMIO_STUB_READ,
++        .addr = addr,
++        .size = len,
++        .val = 0
++    };
++    uint64_t buf = 0;
++
++    if (addr >= dev->size) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                     "mmio-stub: out-of-bounds read at 0x%"HWADDR_PRIx
++                     " (size 0x%"PRIx64")\n", addr, dev->size);
++        return 0;
++    }
++
++    if (!qemu_chr_fe_backend_connected(&dev->chr)) {
++        qemu_log_mask(LOG_GUEST_ERROR, 
++                     "mmio-stub: no chardev connected for read at 0x%"
++                     HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++
++    // Send read request
++    qemu_chr_fe_write_all(&dev->chr, (uint8_t *)&hdr, sizeof(hdr));
++    
++    // Read response
++    if (qemu_chr_fe_read_all(&dev->chr, (uint8_t *)&buf, len) != len) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                     "mmio-stub: failed to read response for addr 0x%"
++                     HWADDR_PRIx "\n", addr);
++        return 0;
++    }
++
++    return buf;
++}
++
++static void mmio_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned len)
++{
++    MMIOStub *dev = MMIO_STUB(opaque);
++    struct mmio_stub_msg_hdr hdr = {
++        .op = MMIO_STUB_WRITE,
++        .addr = addr,
++        .size = len,
++        .val = val
++    };
++    uint8_t ok = 0;
++
++    if (addr >= dev->size) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                     "mmio-stub: out-of-bounds write at 0x%"HWADDR_PRIx
++                     " (size 0x%"PRIx64")\n", addr, dev->size);
++        return;
++    }
++
++    if (!qemu_chr_fe_backend_connected(&dev->chr)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                     "mmio-stub: no chardev connected for write at 0x%"
++                     HWADDR_PRIx "\n", addr);
++        return;
++    }
++
++    // Send write request
++    qemu_chr_fe_write_all(&dev->chr, (uint8_t *)&hdr, sizeof(hdr));
++
++    // Read acknowledgment
++    if (qemu_chr_fe_read_all(&dev->chr, &ok, sizeof(ok)) != sizeof(ok)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                     "mmio-stub: failed to read ack for write at 0x%"
++                     HWADDR_PRIx "\n", addr);
++    }
++}
++
++static const MemoryRegionOps mmio_stub_ops = {
++    .read = mmio_stub_read,
++    .write = mmio_stub_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = {
++        .min_access_size = 1,
++        .max_access_size = 8,
++    },
++};
++
++// Realizes the MMIO stub device (Initializes its memory region and chardev handlers).
++static void mmio_stub_realize(DeviceState *dev, Error **errp)
++{
++    MMIOStub *s = MMIO_STUB(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++    
++    uint64_t region_size = s->size ? s->size : MMIO_STUB_DEFAULT_SIZE;
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &mmio_stub_ops, s,
++                         "mmio-stub", region_size);
++    sysbus_init_mmio(sbd, &s->iomem);
++    
++    qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL, s, NULL, true);
++}
++
++static void mmio_stub_init(Object *obj)
++{
++    MMIOStub *s = MMIO_STUB(obj);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
++    
++    sysbus_init_irq(sbd, &s->irq);
++}
++
++static const Property mmio_stub_properties[] = {
++    DEFINE_PROP_CHR("chardev", MMIOStub, chr),
++    DEFINE_PROP_UINT64("size", MMIOStub, size, MMIO_STUB_DEFAULT_SIZE),
++};
++
++static void mmio_stub_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    
++    dc->realize = mmio_stub_realize;
++    device_class_set_props(dc, mmio_stub_properties);
++    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
++}
++
++static const TypeInfo mmio_stub_info = {
++    .name          = TYPE_MMIO_STUB,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(MMIOStub),
++    .instance_init = mmio_stub_init,
++    .class_init    = mmio_stub_class_init,
++};
++
++static void mmio_stub_register_types(void)
++{
++    type_register_static(&mmio_stub_info);
++}
++
++type_init(mmio_stub_register_types)
+diff --git a/include/hw/misc/mmio-stub.h b/include/hw/misc/mmio-stub.h
+new file mode 100644
+index 0000000000..a25154d766
+--- /dev/null
++++ b/include/hw/misc/mmio-stub.h
+@@ -0,0 +1,34 @@
++#ifndef HW_MMIO_STUB_H
++#define HW_MMIO_STUB_H
++
++#include "hw/sysbus.h"
++#include "chardev/char-fe.h"
++#include "qom/object.h"
++
++#define TYPE_MMIO_STUB "mmio-stub"
++OBJECT_DECLARE_SIMPLE_TYPE(MMIOStub, MMIO_STUB)
++
++#define MMIO_STUB_DEFAULT_SIZE 0x1000
++
++enum mmio_stub_op {
++    MMIO_STUB_READ,
++    MMIO_STUB_WRITE
++};
++
++struct mmio_stub_msg_hdr {
++    uint8_t op;
++    uint8_t size;
++    uint64_t addr;
++    uint64_t val;
++} QEMU_PACKED;
++
++struct MMIOStub {
++    SysBusDevice parent_obj;
++    
++    MemoryRegion iomem;
++    CharBackend chr;
++    qemu_irq irq;
++    uint64_t size;
++};
++
++#endif /* HW_MMIO_STUB_H */
